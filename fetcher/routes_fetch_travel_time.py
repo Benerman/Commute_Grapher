@@ -11,7 +11,7 @@ except ImportError:
 
 load_dotenv()
 
-DB_PATH = os.getenv("DB_PATH", "commute.db")
+DB_PATH = os.getenv("DB_PATH")
 
 API_KEY = os.environ["GOOGLE_MAPS_API_KEY"]
 
