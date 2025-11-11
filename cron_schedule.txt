@@ -1,0 +1,1 @@
+*/10 * * * 1-5 /usr/bin/python3 /path/to/route_fetch_travel_time.py >> /var/log/commute_$(date +\%Y-\%m-\%d).log 2>&1
