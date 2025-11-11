@@ -1,17 +1,26 @@
+# route_fetch_travel_time.py
 import os, sqlite3
 import requests
 from dotenv import load_dotenv
-import json, time, uuid
-from datetime import datetime
+import json, uuid
+from datetime import datetime, time as dtime
+try:
+    from zoneinfo import ZoneInfo  # Py>=3.9
+except ImportError:
+    from backports.zoneinfo import ZoneInfo  # type: ignore
 
 load_dotenv()
 
 API_KEY = os.environ["GOOGLE_MAPS_API_KEY"]
 
-ORIGIN_LABEL = os.environ["ORIGIN_LABEL"]
-ORIGIN_ADDRESS = os.environ["ORIGIN_ADDRESS"]
-DEST_LABEL = os.environ["DEST_LABEL"]
-DEST_ADDRESS = os.environ["DEST_ADDRESS"]
+# Define both endpoints up front
+HOME_LABEL   = os.environ["HOME_LABEL"]
+HOME_ADDRESS = os.environ["HOME_ADDRESS"]
+WORK_LABEL   = os.environ["WORK_LABEL"]
+WORK_ADDRESS = os.environ["WORK_ADDRESS"]
+
+# Optional timezone; defaults to America/New_York
+LOCAL_TZ = os.getenv("LOCAL_TZ", "America/New_York")
 
 DB = "commute.db"
 PROVIDER = "google"
@@ -21,7 +30,6 @@ ROUTES_URL = "https://routes.googleapis.com/directions/v2:computeRoutes"
 
 
 def get_db():
-    # default isolation uses implicit transactions; we'll manage with context manager
     return sqlite3.connect(DB)
 
 
@@ -60,28 +68,23 @@ def fetch_coords(label: str, address: str):
 
 def _extract_route_info(route):
     description = route["description"]
-
-    # distance
-    meters = route.get("distanceMeters")
-    miles_text = route["localizedValues"]["distance"]["text"]  # e.g., "12.3 mi"
-    # duration
-    duration_seconds_str = route["duration"]                    # e.g., "1532s"
+    meters = int(route.get("distanceMeters"))
+    miles_text = route["localizedValues"]["distance"]["text"]          # "12.3 mi"
+    duration_seconds_str = route["duration"]                           # "1532s"
     duration_static_text = route["localizedValues"]["staticDuration"]["text"]  # "25 min"
     duration_minutes_text = route["localizedValues"]["duration"]["text"]       # "28 min"
 
-    # parse localized strings safely (handles "min" / "mins")
     def _to_int_minutes(s: str) -> int:
         return int(s.split()[0].replace(",", ""))
 
-    output = {
+    return {
         "description": description,
-        "meters": int(meters),
+        "meters": meters,
         "miles": float(miles_text.split()[0].replace(",", "")),
         "duration_seconds": int(duration_seconds_str.rstrip("s")),
         "duration_static": _to_int_minutes(duration_static_text),
         "duration_minutes": _to_int_minutes(duration_minutes_text),
     }
-    return output
 
 
 def fetch_directions(o_lat, o_lon, d_lat, d_lon):
@@ -92,9 +95,7 @@ def fetch_directions(o_lat, o_lon, d_lat, d_lon):
         "units": "IMPERIAL",
         "computeAlternativeRoutes": True,
         "routingPreference": "TRAFFIC_AWARE_OPTIMAL",
-        # "departureTime": {"seconds": int(time.time())}
     }
-
     headers = {
         "X-Goog-Api-Key": API_KEY,
         "Content-Type": "application/json",
@@ -102,7 +103,6 @@ def fetch_directions(o_lat, o_lon, d_lat, d_lon):
     }
 
     r = requests.post(ROUTES_URL, headers=headers, json=body, timeout=25)
-
     if not r.ok:
         try:
             body_text = r.json()
@@ -117,21 +117,61 @@ def fetch_directions(o_lat, o_lon, d_lat, d_lon):
     if not data.get("routes"):
         raise RuntimeError(f"Routes API failed: no routes returned - {data}")
 
-    results = []
-    for route in data["routes"]:
-        results.append(_extract_route_info(route))
-    return results
+    return [_extract_route_info(rt) for rt in data["routes"]]
+
+
+def _now_local():
+    return datetime.now(ZoneInfo(LOCAL_TZ))
+
+
+def _in_window(now_t: datetime, start: dtime, end: dtime) -> bool:
+    """True if local time is within [start, end]; assumes same-day window (no overnight)."""
+    t = now_t.time()
+    return (t >= start) and (t <= end)
+
+
+def choose_direction():
+    """
+    Windows (local time):
+      - 05:30–10:30 → Home -> Work
+      - 10:40–18:30 → Work -> Home
+    Outside those windows: no request is made (exit cleanly).
+    Override:
+      - DIRECTION=H2W or W2H to force a direction regardless of time.
+    """
+    override = os.getenv("DIRECTION", "").upper().strip()
+    if override in {"H2W", "W2H"}:
+        return ("HOME", "WORK") if override == "H2W" else ("WORK", "HOME")
+
+    now = _now_local()
+    if _in_window(now, dtime(5, 30), dtime(10, 30)):
+        return ("HOME", "WORK")
+    if _in_window(now, dtime(10, 40), dtime(18, 30)):
+        return ("WORK", "HOME")
+
+    return (None, None)  # outside windows
 
 
 def main():
+    src, dst = choose_direction()
+    if src is None:
+        print("Outside configured commute windows; no request made.")
+        return
+
+    if src == "HOME":
+        ORIGIN_LABEL, ORIGIN_ADDRESS = HOME_LABEL, HOME_ADDRESS
+        DEST_LABEL, DEST_ADDRESS = WORK_LABEL, WORK_ADDRESS
+    else:
+        ORIGIN_LABEL, ORIGIN_ADDRESS = WORK_LABEL, WORK_ADDRESS
+        DEST_LABEL, DEST_ADDRESS = HOME_LABEL, HOME_ADDRESS
+
     o_lat, o_lon = fetch_coords(ORIGIN_LABEL, ORIGIN_ADDRESS)
     d_lat, d_lon = fetch_coords(DEST_LABEL, DEST_ADDRESS)
 
     results = fetch_directions(o_lat, o_lon, d_lat, d_lon)
 
-    # ---- Atomic batch insert (all-or-nothing) ----
+    # Atomic batch insert (group all routes for this run)
     batch_id = uuid.uuid4().hex
-    # Fixed per-run timestamp (ISO seconds precision for readability & grouping)
     batch_ts = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
 
     rows = [
@@ -152,7 +192,7 @@ def main():
 
     con = get_db()
     try:
-        with con:  # single transaction; commit once; rollback on any error
+        with con:
             con.executemany(
                 """
                 INSERT INTO travel_times(
@@ -166,11 +206,13 @@ def main():
     finally:
         con.close()
 
+    dir_str = f"{ORIGIN_LABEL} -> {DEST_LABEL}"
     for r in results:
         print(
-            f"[{batch_id}] Logged route: {r['description']} - {r['duration_minutes']} min, "
+            f"[{batch_id}] {dir_str}: {r['description']} | {r['duration_minutes']} min | "
             f"{r['meters']/1000:.1f} km / {r['miles']} mi"
         )
+
 
 if __name__ == "__main__":
     main()

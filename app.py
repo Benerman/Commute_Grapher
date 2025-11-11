@@ -1,133 +1,213 @@
-import sqlite3
-from flask import Flask, jsonify, render_template_string, request
+from flask import Flask, render_template, request, send_file, abort, jsonify
+import os, sqlite3, io
+from datetime import datetime, timedelta, time
+import matplotlib
+matplotlib.use("Agg")  # headless
+import matplotlib.pyplot as plt
+from dotenv import load_dotenv
 
-DB = "commute.db"
+load_dotenv()
+
+DB_PATH = os.getenv("DB_PATH", "commute.db")
+HOME_LABEL = os.getenv("HOME_LABEL", "Home")
+WORK_LABEL = os.getenv("WORK_LABEL", "Work")
+
 app = Flask(__name__)
 
-def q(sql, args=()):
-    con = sqlite3.connect(DB)
+def get_rows(direction: str, days: int):
+    if direction == "H2W":
+        origin, dest = HOME_LABEL, WORK_LABEL
+    else:
+        origin, dest = WORK_LABEL, HOME_LABEL
+
+    con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     cur = con.cursor()
-    cur.execute(sql, args)
-    rows = cur.fetchall()
+    sql = """
+      SELECT ts, origin_label, dest_label, description, miles, duration_minutes, duration_static
+      FROM travel_times
+      WHERE origin_label = ? AND dest_label = ?
+        AND ts >= datetime('now', ?)
+      ORDER BY ts ASC
+    """
+    params = (origin, dest, f"-{int(days)} days")
+    rows = [dict(r) for r in cur.execute(sql, params)]
     con.close()
     return rows
 
-TEMPLATE = """
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Commute Monitor</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <style>
-    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
-    .row { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    select, button { padding: 6px 10px; font-size: 14px; }
-    #chart { max-width: 1000px; }
-  </style>
-</head>
-<body>
-  <h2>Estimated Travel Time</h2>
-  <div class="row">
-    <label>Route:</label>
-    <select id="route">
-      {% for r in routes %}
-        <option value="{{r['origin_label']}}|{{r['dest_label']}}" {% if r['origin_label']==default_o and r['dest_label']==default_d %}selected{% endif %}>
-          {{r['origin_label']}} → {{r['dest_label']}}
-        </option>
-      {% endfor %}
-    </select>
-
-    <label>Days:</label>
-    <select id="days">
-      <option value="1">1</option>
-      <option value="3">3</option>
-      <option value="7" selected>7</option>
-      <option value="14">14</option>
-      <option value="30">30</option>
-    </select>
-
-    <button onclick="reload()">Refresh</button>
-  </div>
-
-  <canvas id="chart" height="120"></canvas>
-
-  <script>
-    const ctx = document.getElementById('chart').getContext('2d');
-    let chart;
-
-    async function load() {
-      const route = document.getElementById('route').value;
-      const days = document.getElementById('days').value;
-      const [o, d] = route.split('|');
-      const resp = await fetch(`/api/travel_times?origin=${encodeURIComponent(o)}&dest=${encodeURIComponent(d)}&days=${days}`);
-      const data = await resp.json();
-      const labels = data.points.map(p => p.ts);
-      const mins = data.points.map(p => (p.seconds/60).toFixed(1));
-
-      if (chart) chart.destroy();
-      chart = new Chart(ctx, {
-        type: 'line',
-        data: {
-          labels,
-          datasets: [{
-            # inside chart dataset label creation:
-            label: `${data.origin} → ${data.dest} (${data.profile}, Google)`,
-            data: mins,
-            fill: false,
-            tension: 0.2
-          }]
-        },
-        options: {
-          interaction: { mode: 'nearest', intersect: false },
-          parsing: false,
-          scales: {
-            y: { title: { display: true, text: 'Minutes' } },
-            x: { title: { display: true, text: 'Timestamp' } }
-          },
-          plugins: {
-            legend: { display: true }
-          }
-        }
-      });
-    }
-
-    function reload(){ load(); }
-    load();
-  </script>
-</body>
-</html>
-"""
-
-@app.get("/")
+@app.route("/")
 def index():
-    routes = q("""
-      SELECT origin_label, dest_label, COUNT(*) c
-      FROM travel_times
-      GROUP BY origin_label, dest_label
-      ORDER BY c DESC
-    """)
-    default_o = routes[0]["origin_label"] if routes else ""
-    default_d = routes[0]["dest_label"] if routes else ""
-    return render_template_string(TEMPLATE, routes=routes, default_o=default_o, default_d=default_d)
+    direction = request.args.get("direction", "H2W").upper()
+    days = int(request.args.get("days", 14))
+    chart = request.args.get("chart", "line")
+    show_traffic = request.args.get("traffic", "1") == "1"
+    show_static = request.args.get("static", "1") == "1"
+    limit = request.args.get("limit", "").strip()
 
-@app.get("/api/travel_times")
-def api_travel_times():
-    origin = request.args.get("origin")
-    dest = request.args.get("dest")
-    days = int(request.args.get("days", "7"))
-    rows = q("""
-      SELECT strftime('%Y-%m-%d %H:%M', ts) ts, seconds, meters, profile
-      FROM travel_times
-      WHERE origin_label=? AND dest_label=?
-        AND ts >= datetime('now', ?)
-      ORDER BY ts ASC
-    """, (origin, dest, f'-{days} days'))
-    points = [dict(ts=r["ts"], seconds=r["seconds"], meters=r["meters"]) for r in rows]
-    prof = rows[0]["profile"] if rows else "driving-car"
-    return jsonify({"origin": origin, "dest": dest, "profile": prof, "points": points})
+    rows = get_rows(direction, days)
+    if limit.isdigit():
+        rows = rows[-int(limit):]
+
+    return render_template(
+        "index.html",
+        direction=direction,
+        days=days,
+        chart=chart,
+        show_traffic=show_traffic,
+        show_static=show_static,
+        rows=rows
+    )
+
+@app.route("/chart.png")
+def chart_png():
+
+    direction = request.args.get("direction", "H2W").upper()
+    days = int(request.args.get("days", 14))
+    chart = request.args.get("chart", "line")
+    show_traffic = request.args.get("traffic", "1") == "1"
+    show_static = request.args.get("static", "1") == "1"
+    limit = request.args.get("limit", "").strip()
+    filter_hours = request.args.get("filter_hours", "1") == "1"  # keep 5:00–19:00 filter on by default
+
+    rows = get_rows(direction, days)
+
+    # Filter to 05:00–19:00 if enabled
+    if filter_hours:
+        START, END = time(5, 0), time(19, 0)
+        rows = [r for r in rows if START <= datetime.fromisoformat(r["ts"]).time() <= END]
+
+    if limit.isdigit():
+        rows = rows[-int(limit):]
+
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+
+    if not rows:
+        # Show a placeholder image instead of 404
+        ax.axis("off")
+        title = "Home → Work" if direction == "H2W" else "Work → Home"
+        ax.text(0.5, 0.6, "No data to plot", ha="center", va="center", fontsize=18)
+        ax.text(0.5, 0.5, f"{title}", ha="center", va="center", fontsize=12)
+        ax.text(0.5, 0.4, f"Window: 05:00–19:00 • Last {days} days", ha="center", va="center", fontsize=10)
+        fig.tight_layout()
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight")
+        plt.close(fig)
+        buf.seek(0)
+        return send_file(buf, mimetype="image/png")
+
+    xs = [datetime.fromisoformat(r["ts"]) for r in rows]
+    y_traf = [r["duration_minutes"] for r in rows]
+    y_stat = [r["duration_static"] for r in rows]
+
+    if chart == "bar":
+        width = 0.4
+        if show_traffic:
+            ax.bar(range(len(xs)), y_traf, width, label="With traffic (min)")
+        if show_static:
+            base_x = [x + (width if show_traffic else 0) for x in range(len(xs))]
+            ax.bar(base_x, y_stat, width, label="No traffic (min)")
+        ax.set_xticks(range(len(xs)))
+        ax.set_xticklabels([dt.strftime("%m-%d %H:%M") for dt in xs], rotation=45, ha="right")
+    elif chart == "area":
+        if show_traffic:
+            ax.fill_between(xs, y_traf, alpha=0.3, label="With traffic (min)")
+            ax.plot(xs, y_traf)
+        if show_static:
+            ax.fill_between(xs, y_stat, alpha=0.3, label="No traffic (min)")
+            ax.plot(xs, y_stat)
+        ax.tick_params(axis="x", labelrotation=45)
+    elif chart == "scatter":
+        if show_traffic:
+            ax.scatter(xs, y_traf, label="With traffic (min)")
+        if show_static:
+            ax.scatter(xs, y_stat, label="No traffic (min)")
+        ax.tick_params(axis="x", labelrotation=45)
+    else:  # line
+        if show_traffic:
+            ax.plot(xs, y_traf, label="With traffic (min)")
+        if show_static:
+            ax.plot(xs, y_stat, label="No traffic (min)")
+        ax.tick_params(axis="x", labelrotation=45)
+
+    ax.set_ylabel("Minutes")
+    title = "Home → Work" if direction == "H2W" else "Work → Home"
+    ax.set_title(f"Commute durations • {title} • 05:00–19:00 • last {days} days")
+    ax.legend(loc="best")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return send_file(buf, mimetype="image/png")
+
+@app.route("/data.json")
+def data_json():
+    direction = request.args.get("direction", "H2W").upper()
+    days = int(request.args.get("days", 14))
+    limit = request.args.get("limit", "").strip()
+    filter_hours = request.args.get("filter_hours", "1") == "1"
+
+    rows = get_rows(direction, days)
+
+    if filter_hours:
+        START, END = time(5, 0), time(19, 0)
+        out = []
+        for r in rows:
+            try:
+                dt = datetime.fromisoformat(r["ts"])
+            except Exception:
+                continue
+            if START <= dt.time() <= END:
+                out.append(r)
+        rows = out
+
+    if limit.isdigit():
+        rows = rows[-int(limit):]
+
+    return jsonify(rows)
+
+
+@app.route("/debug/summary")
+def debug_summary():
+    def _bounds(rs):
+        if not rs: return {"count": 0}
+        try:
+            ts_vals = [datetime.fromisoformat(r["ts"]) for r in rs]
+            return {
+                "count": len(rs),
+                "min_ts": min(ts_vals).isoformat(sep=" ", timespec="seconds"),
+                "max_ts": max(ts_vals).isoformat(sep=" ", timespec="seconds"),
+            }
+        except Exception:
+            return {"count": len(rs)}
+
+    def _filter_5to19(rs):
+        START, END = time(5, 0), time(19, 0)
+        out = []
+        for r in rs:
+            try:
+                dt = datetime.fromisoformat(r["ts"])
+            except Exception:
+                continue
+            if START <= dt.time() <= END:
+                out.append(r)
+        return out
+
+    out = {}
+    for d in ("H2W", "W2H"):
+        r14 = get_rows(d, 14)
+        r30 = get_rows(d, 30)
+        out[d] = {
+            "14d_all": _bounds(r14),
+            "14d_5to19": _bounds(_filter_5to19(r14)),
+            "30d_all": _bounds(r30),
+            "30d_5to19": _bounds(_filter_5to19(r30)),
+        }
+    return jsonify(out)
+
+
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=False)
+    port = int(os.getenv("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=True)
