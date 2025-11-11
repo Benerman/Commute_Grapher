@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DB_PATH = os.getenv("DB_PATH", "commute.db")
+DB_PATH = os.getenv("DB_PATH")
 HOME_LABEL = os.getenv("HOME_LABEL", "Home")
 WORK_LABEL = os.getenv("WORK_LABEL", "Work")
 
