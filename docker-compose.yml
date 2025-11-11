@@ -1,0 +1,25 @@
+
+services:
+  api:
+    build: ./api
+    container_name: commute-api
+    env_file:
+      - .env
+    volumes:
+      - ./commute.db:/data/commute.db
+      - ./api/app.py:/app/app.py
+      - ./api/templates:/app/templates
+    ports:
+      - "5000:5000"
+    restart: unless-stopped
+  fetcher:
+    build: ./fetcher
+    container_name: commute-fetcher
+    env_file:
+      - .env
+    volumes:
+      - ./commute.db:/data/commute.db
+      - ./fetcher/route_fetch_travel_time.py:/app/route_fetch_travel_time.py
+      - ./fetcher/cron/commute:/etc/cron.d/commute
+    command: ["/usr/local/bin/supercronic", "/etc/cron.d/commute"]
+    restart: unless-stopped
